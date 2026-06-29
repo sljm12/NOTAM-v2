@@ -15,6 +15,7 @@ Output fields per NOTAM:
   from          – effective-from datetime string, or null
   to            – effective-to datetime string, or null
   time_schedule – time schedule string, or null
+  locations     – list of dicts with lat/lon in decimal degrees (empty list if none)
   raw           – the unmodified block text for reference
 
 Usage:
@@ -60,6 +61,10 @@ STRUCTURED_LABELS_RE = re.compile(
     r"^(Lower:|From:|Time schedule:)", re.IGNORECASE
 )
 
+# NOTAM coordinate format: DDMMSSsHDDDMMSSsH  e.g. 011914N1034544E
+# Lat: 6 digits + N/S   Lon: 7 digits + E/W
+COORD_RE = re.compile(r"\b(\d{6}[NS])(\d{7}[EW])\b")
+
 
 # ---------------------------------------------------------------------------
 # Block collection
@@ -104,6 +109,47 @@ def collect_raw_blocks(lines: list[str]) -> list[list[str]]:
 
 def normalise_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_coords(text: str) -> list[dict]:
+    """
+    Find all NOTAM-format coordinates in *text* and return them as a list of
+    dicts with decimal-degree lat/lon.
+
+    Format: DDMMSSsH DDDMMSSsH  e.g. 011914N 1034544E
+      Lat part: 2-digit DD, 2-digit MM, 2-digit SS, N/S
+      Lon part: 3-digit DDD, 2-digit MM, 2-digit SS, E/W
+    """
+    results = []
+    seen = set()
+    for lat_raw, lon_raw in COORD_RE.findall(text):
+        key = (lat_raw, lon_raw)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        lat_d = int(lat_raw[0:2])
+        lat_m = int(lat_raw[2:4])
+        lat_s = int(lat_raw[4:6])
+        lat_hem = lat_raw[6]
+        lat_dec = lat_d + lat_m / 60 + lat_s / 3600
+        if lat_hem == "S":
+            lat_dec = -lat_dec
+
+        lon_d = int(lon_raw[0:3])
+        lon_m = int(lon_raw[3:5])
+        lon_s = int(lon_raw[5:7])
+        lon_hem = lon_raw[7]
+        lon_dec = lon_d + lon_m / 60 + lon_s / 3600
+        if lon_hem == "W":
+            lon_dec = -lon_dec
+
+        results.append({
+            "raw":       f"{lat_raw} {lon_raw}",
+            "latitude":  round(lat_dec, 6),
+            "longitude": round(lon_dec, 6),
+        })
+    return results
 
 
 def parse_block(block: list[str]) -> dict:
@@ -162,6 +208,7 @@ def parse_block(block: list[str]) -> dict:
 
     message = normalise_ws(" ".join(message_parts))
     time_sched = normalise_ws(" ".join(sched_parts)) or None
+    locations = parse_coords(raw_text)
 
     return {
         "id":            notam_id,
@@ -172,14 +219,10 @@ def parse_block(block: list[str]) -> dict:
         "from":          from_dt,
         "to":            to_dt,
         "time_schedule": time_sched,
+        "locations":     locations,
         "raw":           raw_text,
     }
 
-def extract_from_text(text):
-    lines=text.splitlines()
-    blocks = collect_raw_blocks(lines)
-    notams = [parse_block(b) for b in blocks]
-    return notams
 
 # ---------------------------------------------------------------------------
 # Main
