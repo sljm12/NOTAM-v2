@@ -74,9 +74,13 @@ STRUCTURED_LABELS_RE = re.compile(
     r"^(Lower:|From:|Time schedule:)", re.IGNORECASE
 )
 
-# NOTAM coordinate format: DDMMSSsHDDDMMSSsH  e.g. 011914N1034544E
-# Lat: 6 digits + N/S   Lon: 7 digits + E/W
-COORD_RE = re.compile(r"\b(\d{6}[NS])(\d{7}[EW])\b")
+# NOTAM coordinate formats:
+#   Integer seconds:  DDMMSSsH DDDMMSSsH          e.g. 011914N1034544E
+#   Decimal seconds:  DDMMSSss.ssH DDDMMSSss.ssH  e.g. 023000.00N1051628.72E
+#
+# Lat:  2-digit DD, 2-digit MM, 2-digit SS + optional decimal, N/S
+# Lon:  3-digit DDD, 2-digit MM, 2-digit SS + optional decimal, E/W
+COORD_RE = re.compile(r"\b(\d{6}(?:\.\d+)?[NS])(\d{7}(?:\.\d+)?[EW])\b")
 
 
 # ---------------------------------------------------------------------------
@@ -124,14 +128,46 @@ def normalise_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _dms_to_dec(deg: int, mins: int, secs: float, hem: str) -> float:
+    """Convert degrees/minutes/seconds + hemisphere to signed decimal degrees."""
+    dec = deg + mins / 60 + secs / 3600
+    return -dec if hem in ("S", "W") else dec
+
+
+def _parse_lat(raw: str) -> tuple[float, str]:
+    """
+    Parse a raw latitude token (e.g. '011914N' or '023000.00N').
+    Returns (decimal_degrees, hemisphere_char).
+    """
+    hem = raw[-1]                    # N or S
+    numeric = raw[:-1]               # e.g. '011914' or '023000.00'
+    d = int(numeric[0:2])
+    m = int(numeric[2:4])
+    s = float(numeric[4:])          # handles '00', '00.00', '28.72', etc.
+    return _dms_to_dec(d, m, s, hem), hem
+
+
+def _parse_lon(raw: str) -> tuple[float, str]:
+    """
+    Parse a raw longitude token (e.g. '1034544E' or '1051628.72E').
+    Returns (decimal_degrees, hemisphere_char).
+    """
+    hem = raw[-1]                    # E or W
+    numeric = raw[:-1]               # e.g. '1034544' or '1051628.72'
+    d = int(numeric[0:3])
+    m = int(numeric[3:5])
+    s = float(numeric[5:])          # handles '44', '28.72', etc.
+    return _dms_to_dec(d, m, s, hem), hem
+
+
 def parse_coords(text: str) -> list[dict]:
     """
     Find all NOTAM-format coordinates in *text* and return them as a list of
     dicts with decimal-degree lat/lon.
 
-    Format: DDMMSSsH DDDMMSSsH  e.g. 011914N 1034544E
-      Lat part: 2-digit DD, 2-digit MM, 2-digit SS, N/S
-      Lon part: 3-digit DDD, 2-digit MM, 2-digit SS, E/W
+    Supported formats:
+      Integer seconds:  DDMMSSsH DDDMMSSsH          e.g. 011914N1034544E
+      Decimal seconds:  DDMMSSss.ssH DDDMMSSss.ssH  e.g. 023000.00N1051628.72E
     """
     results = []
     seen = set()
@@ -141,21 +177,8 @@ def parse_coords(text: str) -> list[dict]:
             continue
         seen.add(key)
 
-        lat_d = int(lat_raw[0:2])
-        lat_m = int(lat_raw[2:4])
-        lat_s = int(lat_raw[4:6])
-        lat_hem = lat_raw[6]
-        lat_dec = lat_d + lat_m / 60 + lat_s / 3600
-        if lat_hem == "S":
-            lat_dec = -lat_dec
-
-        lon_d = int(lon_raw[0:3])
-        lon_m = int(lon_raw[3:5])
-        lon_s = int(lon_raw[5:7])
-        lon_hem = lon_raw[7]
-        lon_dec = lon_d + lon_m / 60 + lon_s / 3600
-        if lon_hem == "W":
-            lon_dec = -lon_dec
+        lat_dec, _ = _parse_lat(lat_raw)
+        lon_dec, _ = _parse_lon(lon_raw)
 
         results.append({
             "raw":       f"{lat_raw} {lon_raw}",
