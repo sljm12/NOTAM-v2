@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-NOTAM List Cleaner — JSON output
-=================================
+NOTAM List Cleaner
+==================
 Extracts NOTAM entries prefixed with '+' from a raw NOTAM report file,
-strips the preamble header and page-break footers, then writes a JSON
-array where each element represents one NOTAM with parsed fields.
+strips the preamble header and page-break footers, then writes structured
+output in either JSON or GeoJSON format.
 
-Output fields per NOTAM:
+JSON output fields per NOTAM:
   id            – e.g. "A1737/26"
   type          – single-letter code, e.g. "N", "R"
   message       – body text (before structured fields), whitespace normalised
@@ -15,16 +15,29 @@ Output fields per NOTAM:
   from          – effective-from datetime string, or null
   to            – effective-to datetime string, or null
   time_schedule – time schedule string, or null
-  locations     – list of dicts with lat/lon in decimal degrees (empty list if none)
+  locations     – list of dicts with raw token + decimal-degree lat/lon
   raw           – the unmodified block text for reference
 
-Usage:
-    python extract_notams.py <input_file> [output_file]
+GeoJSON output:
+  Produces a FeatureCollection. Each NOTAM with coordinates becomes one or
+  more Features:
+    • 1 coordinate  → Point
+    • 2 coordinates → LineString
+    • 3+ coordinates → Polygon (ring automatically closed if needed)
+  NOTAMs with no coordinates are included as Features with geometry: null.
+  All parsed fields (except raw locations list) are stored in properties.
 
-    If no output file is given, output is written to
-    <input_stem>.json in the same directory.
+Usage:
+    python extract_notams.py <input_file> [output_file] [--format json|geojson]
+
+    -f / --format   json     Plain JSON array (default)
+                    geojson  GeoJSON FeatureCollection
+
+    If no output file is given, the output is written to
+    <input_stem>.json or <input_stem>.geojson in the same directory.
 """
 
+import argparse
 import json
 import re
 import sys
@@ -225,33 +238,115 @@ def parse_block(block: list[str]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# GeoJSON serialiser
+# ---------------------------------------------------------------------------
+
+def notam_to_geojson_feature(notam: dict) -> dict:
+    """
+    Convert one parsed NOTAM dict to a GeoJSON Feature.
+
+    Geometry rules:
+      0 locations → null geometry
+      1 location  → Point
+      2 locations → LineString
+      3+ locations → Polygon (ring closed automatically if needed)
+    """
+    locs = notam["locations"]
+    n = len(locs)
+
+    # GeoJSON uses [longitude, latitude] order
+    coords = [[loc["longitude"], loc["latitude"]] for loc in locs]
+
+    if n == 0:
+        geometry = None
+    elif n == 1:
+        geometry = {"type": "Point", "coordinates": coords[0]}
+    elif n == 2:
+        geometry = {"type": "LineString", "coordinates": coords}
+    else:
+        # Close the polygon ring if the last point differs from the first
+        ring = coords if coords[0] == coords[-1] else coords + [coords[0]]
+        geometry = {"type": "Polygon", "coordinates": [ring]}
+
+    properties = {
+        "id":            notam["id"],
+        "type":          notam["type"],
+        "message":       notam["message"],
+        "lower":         notam["lower"],
+        "upper":         notam["upper"],
+        "from":          notam["from"],
+        "to":            notam["to"],
+        "time_schedule": notam["time_schedule"],
+        # Keep human-readable raw coord tokens for reference
+        "coord_tokens":  [loc["raw"] for loc in locs] or None,
+    }
+
+    return {
+        "type":       "Feature",
+        "geometry":   geometry,
+        "properties": properties,
+    }
+
+
+def to_geojson(notams: list[dict]) -> dict:
+    return {
+        "type":     "FeatureCollection",
+        "features": [notam_to_geojson_feature(n) for n in notams],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Extract NOTAM entries from a raw report file.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("input",  help="Path to the raw NOTAM report file")
+    parser.add_argument("output", nargs="?", help="Output file path (optional)")
+    parser.add_argument(
+        "-f", "--format",
+        choices=["json", "geojson"],
+        default="json",
+        help="Output format: 'json' (default) or 'geojson'",
+    )
+    args = parser.parse_args()
 
-    input_path = Path(sys.argv[1])
+    input_path = Path(args.input)
     if not input_path.exists():
         print(f"Error: file not found – {input_path}")
         sys.exit(1)
 
-    output_path = (
-        Path(sys.argv[2]) if len(sys.argv) >= 3
-        else input_path.with_suffix(".json")
-    )
+    # Determine output path
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        suffix = ".geojson" if args.format == "geojson" else ".json"
+        output_path = input_path.with_suffix(suffix)
 
+    # Parse
     lines = input_path.read_text(encoding="utf-8").splitlines()
     blocks = collect_raw_blocks(lines)
     notams = [parse_block(b) for b in blocks]
 
+    # Serialise
+    if args.format == "geojson":
+        output_data = to_geojson(notams)
+    else:
+        output_data = notams
+
     output_path.write_text(
-        json.dumps(notams, indent=2, ensure_ascii=False),
+        json.dumps(output_data, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+    loc_count = sum(1 for n in notams if n["locations"])
     print(f"Done. {len(notams)} NOTAM entries written to {output_path}")
+    print(f"      {loc_count} entries have coordinates, "
+          f"{len(notams) - loc_count} have no location (null geometry in GeoJSON).")
 
 
 if __name__ == "__main__":
