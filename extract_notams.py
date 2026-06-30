@@ -43,6 +43,9 @@ import re
 import sys
 from pathlib import Path
 
+from notam_common import normalise_ws, parse_coords
+from notam_common import notam_to_geojson_feature, to_geojson
+
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -73,14 +76,6 @@ TIME_SCHED_LINE_RE = re.compile(
 STRUCTURED_LABELS_RE = re.compile(
     r"^(Lower:|From:|Time schedule:)", re.IGNORECASE
 )
-
-# NOTAM coordinate formats:
-#   Integer seconds:  DDMMSSsH DDDMMSSsH          e.g. 011914N1034544E
-#   Decimal seconds:  DDMMSSss.ssH DDDMMSSss.ssH  e.g. 023000.00N1051628.72E
-#
-# Lat:  2-digit DD, 2-digit MM, 2-digit SS + optional decimal, N/S
-# Lon:  3-digit DDD, 2-digit MM, 2-digit SS + optional decimal, E/W
-COORD_RE = re.compile(r"\b(\d{6}(?:\.\d+)?[NS])(\d{7}(?:\.\d+)?[EW])\b")
 
 
 # ---------------------------------------------------------------------------
@@ -123,69 +118,6 @@ def collect_raw_blocks(lines: list[str]) -> list[list[str]]:
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
-
-def normalise_ws(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _dms_to_dec(deg: int, mins: int, secs: float, hem: str) -> float:
-    """Convert degrees/minutes/seconds + hemisphere to signed decimal degrees."""
-    dec = deg + mins / 60 + secs / 3600
-    return -dec if hem in ("S", "W") else dec
-
-
-def _parse_lat(raw: str) -> tuple[float, str]:
-    """
-    Parse a raw latitude token (e.g. '011914N' or '023000.00N').
-    Returns (decimal_degrees, hemisphere_char).
-    """
-    hem = raw[-1]                    # N or S
-    numeric = raw[:-1]               # e.g. '011914' or '023000.00'
-    d = int(numeric[0:2])
-    m = int(numeric[2:4])
-    s = float(numeric[4:])          # handles '00', '00.00', '28.72', etc.
-    return _dms_to_dec(d, m, s, hem), hem
-
-
-def _parse_lon(raw: str) -> tuple[float, str]:
-    """
-    Parse a raw longitude token (e.g. '1034544E' or '1051628.72E').
-    Returns (decimal_degrees, hemisphere_char).
-    """
-    hem = raw[-1]                    # E or W
-    numeric = raw[:-1]               # e.g. '1034544' or '1051628.72'
-    d = int(numeric[0:3])
-    m = int(numeric[3:5])
-    s = float(numeric[5:])          # handles '44', '28.72', etc.
-    return _dms_to_dec(d, m, s, hem), hem
-
-
-def parse_coords(text: str) -> list[dict]:
-    """
-    Find all NOTAM-format coordinates in *text* and return them as a list of
-    dicts with decimal-degree lat/lon.
-
-    Supported formats:
-      Integer seconds:  DDMMSSsH DDDMMSSsH          e.g. 011914N1034544E
-      Decimal seconds:  DDMMSSss.ssH DDDMMSSss.ssH  e.g. 023000.00N1051628.72E
-    """
-    results = []
-    seen = set()
-    for lat_raw, lon_raw in COORD_RE.findall(text):
-        key = (lat_raw, lon_raw)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        lat_dec, _ = _parse_lat(lat_raw)
-        lon_dec, _ = _parse_lon(lon_raw)
-
-        results.append({
-            "raw":       f"{lat_raw} {lon_raw}",
-            "latitude":  round(lat_dec, 6),
-            "longitude": round(lon_dec, 6),
-        })
-    return results
 
 
 def parse_block(block: list[str]) -> dict:
@@ -257,64 +189,6 @@ def parse_block(block: list[str]) -> dict:
         "time_schedule": time_sched,
         "locations":     locations,
         "raw":           raw_text,
-    }
-
-
-# ---------------------------------------------------------------------------
-# GeoJSON serialiser
-# ---------------------------------------------------------------------------
-
-def notam_to_geojson_feature(notam: dict) -> dict:
-    """
-    Convert one parsed NOTAM dict to a GeoJSON Feature.
-
-    Geometry rules:
-      0 locations → null geometry
-      1 location  → Point
-      2 locations → LineString
-      3+ locations → Polygon (ring closed automatically if needed)
-    """
-    locs = notam["locations"]
-    n = len(locs)
-
-    # GeoJSON uses [longitude, latitude] order
-    coords = [[loc["longitude"], loc["latitude"]] for loc in locs]
-
-    if n == 0:
-        geometry = None
-    elif n == 1:
-        geometry = {"type": "Point", "coordinates": coords[0]}
-    elif n == 2:
-        geometry = {"type": "LineString", "coordinates": coords}
-    else:
-        # Close the polygon ring if the last point differs from the first
-        ring = coords if coords[0] == coords[-1] else coords + [coords[0]]
-        geometry = {"type": "Polygon", "coordinates": [ring]}
-
-    properties = {
-        "id":            notam["id"],
-        "type":          notam["type"],
-        "message":       notam["message"],
-        "lower":         notam["lower"],
-        "upper":         notam["upper"],
-        "from":          notam["from"],
-        "to":            notam["to"],
-        "time_schedule": notam["time_schedule"],
-        # Keep human-readable raw coord tokens for reference
-        "coord_tokens":  [loc["raw"] for loc in locs] or None,
-    }
-
-    return {
-        "type":       "Feature",
-        "geometry":   geometry,
-        "properties": properties,
-    }
-
-
-def to_geojson(notams: list[dict]) -> dict:
-    return {
-        "type":     "FeatureCollection",
-        "features": [notam_to_geojson_feature(n) for n in notams],
     }
 
 

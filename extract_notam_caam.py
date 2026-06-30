@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-notam_extractor.py
-
+NOTAM Extractor (CAAM — Malaysia)
+===================================
 Extracts individual NOTAM entries from a NOTAM summary report (exported as
 markdown/text, e.g. from a PDF-to-markdown conversion) and outputs them as
-structured JSON.
+structured JSON or GeoJSON.
 
 Handles common artifacts found in paginated NOTAM summary exports:
   - "--- Page N ---" separators
@@ -15,16 +15,22 @@ Handles common artifacts found in paginated NOTAM summary exports:
     into an entry because the entry itself has no closing paren
 
 Usage:
-    python3 notam_extractor.py INPUT_FILE [-o OUTPUT_FILE]
+    python3 extract_notam_caam.py INPUT_FILE [-o OUTPUT_FILE] [-f json|geojson]
 
 Example:
-    python3 notam_extractor.py SUMMARY_WMFC_A_06_2026.md -o notams.json
+    python3 extract_notam_caam.py SUMMARY_WMFC_A_06_2026.md -o notams.json
+    python3 extract_notam_caam.py SUMMARY_WMFC_A_06_2026.md -f geojson
 """
 
 import argparse
 import json
 import re
 import sys
+from pathlib import Path
+
+from notam_common import parse_coords, normalise_ws
+from notam_common import notam_to_geojson_feature, to_geojson
+
 
 # Matches the start of a NOTAM entry, e.g.:
 #   (A2112/26 NOTAMN
@@ -48,56 +54,6 @@ FIELD_LINE_RE = re.compile(r'^([A-G])\)\s*(.*)$')
 HEADER_RE = re.compile(
     r'^\(?(A\d+/\d+)\s+(NOTAM[A-Z]?)(?:\s+(A\d+/\d+))?'
 )
-
-# Matches both coordinate formats:
-#   011914N1034544E              (DDMMSS, no decimal)
-#   023000.00N1051628.72E        (DDMMSS.ss, with decimal seconds)
-# Latitude: 6 digits (DDMMSS) + optional decimal, then N/S
-# Longitude: 7 digits (DDDMMSS) + optional decimal, then E/W
-COORD_RE = re.compile(
-    r'(\d{2})(\d{2})(\d{2}(?:\.\d+)?)([NS])\s*'
-    r'(\d{3})(\d{2})(\d{2}(?:\.\d+)?)([EW])'
-)
-
-
-def dms_to_ddm(deg: int, minute: int, sec: float, hemisphere: str) -> str:
-    """Convert degrees/minutes/seconds to Degrees Decimal Minutes (DDM),
-    e.g. 03 00 24.44 N -> 03 00.407 N"""
-    decimal_minutes = minute + sec / 60.0
-    return f"{deg:02d} {decimal_minutes:06.3f} {hemisphere}"
-
-
-def extract_locations(text: str) -> list:
-    """Find every lat/lon coordinate pair in the given text and return a
-    list of dicts with the original string, decimal degrees, and DDM."""
-    locations = []
-    for m in COORD_RE.finditer(text):
-        lat_deg, lat_min, lat_sec, lat_hem, lon_deg, lon_min, lon_sec, lon_hem = m.groups()
-
-        lat_deg_i, lat_min_i, lat_sec_f = int(lat_deg), int(lat_min), float(lat_sec)
-        lon_deg_i, lon_min_i, lon_sec_f = int(lon_deg), int(lon_min), float(lon_sec)
-
-        lat_dd = lat_deg_i + lat_min_i / 60.0 + lat_sec_f / 3600.0
-        if lat_hem == 'S':
-            lat_dd = -lat_dd
-        lon_dd = lon_deg_i + lon_min_i / 60.0 + lon_sec_f / 3600.0
-        if lon_hem == 'W':
-            lon_dd = -lon_dd
-
-        locations.append({
-            'raw': m.group(0),
-            'latitude': {
-                'dms': f"{lat_deg}{lat_min}{lat_sec}{lat_hem}",
-                'decimal_degrees': round(lat_dd, 6),
-                'ddm': dms_to_ddm(lat_deg_i, lat_min_i, lat_sec_f, lat_hem),
-            },
-            'longitude': {
-                'dms': f"{lon_deg}{lon_min}{lon_sec}{lon_hem}",
-                'decimal_degrees': round(lon_dd, 6),
-                'ddm': dms_to_ddm(lon_deg_i, lon_min_i, lon_sec_f, lon_hem),
-            },
-        })
-    return locations
 
 
 def clean_page_artifacts(text: str) -> str:
@@ -125,8 +81,6 @@ def find_entry_chunks(text: str):
                 line_start = chunk.rfind('\n', 0, last_paren) + 1
                 line_so_far = chunk[line_start:last_paren + 1].strip()
                 if BARE_FIELD_MARKER_RE.fullmatch(line_so_far):
-                    # No genuine closing paren in source; just strip any
-                    # leaked trailing ICAO header line.
                     chunk = TRAILING_ICAO_RE.sub('', chunk).rstrip()
                 else:
                     chunk = chunk[:last_paren + 1]
@@ -158,7 +112,7 @@ def parse_entry(raw_text: str) -> dict:
 
     lines = raw_text.splitlines()
 
-    fields = {}  # e.g. {'A': '...', 'B': '...', ...}
+    fields = {}
     current_field = None
     buffer = []
 
@@ -169,7 +123,6 @@ def parse_entry(raw_text: str) -> dict:
     for idx, line in enumerate(lines):
         l = line.strip()
         if idx == 0:
-            # header line, e.g. "(A2112/26 NOTAMN" -- skip, already parsed
             continue
         m = FIELD_LINE_RE.match(l)
         if m:
@@ -181,14 +134,10 @@ def parse_entry(raw_text: str) -> dict:
                 buffer.append(l)
     flush()
 
-    # Field A typically looks like "WMFC B) 2605312300 C) 2606050300"
-    # because A/B/C often share one line in these reports. Split it out.
     a_raw = fields.get('A', '')
     icao_match = re.match(r'^(\S+)', a_raw)
     fid = icao_match.group(1) if icao_match else None
 
-    # If B and/or C got swallowed into A's buffer (same line as "A)"),
-    # re-extract them.
     inline_bc = re.search(r'B\)\s*(\S+)(?:\s+C\)\s*(\S+))?', a_raw)
     if inline_bc:
         if 'B' not in fields or not fields['B']:
@@ -196,18 +145,14 @@ def parse_entry(raw_text: str) -> dict:
         if inline_bc.group(2) and ('C' not in fields or not fields['C']):
             fields['C'] = inline_bc.group(2)
 
-    # Field A should just be the ICAO/FIR identifier.
     fields['A'] = fid
 
-    # Strip a trailing lone ')' that closes the whole NOTAM but is still
-    # attached to the last field's text (e.g. "F) GND G) 1000FT AMSL)").
     last_field_letter = None
     if fields:
         last_field_letter = sorted(fields.keys())[-1]
     if last_field_letter and fields[last_field_letter].endswith(')'):
         fields[last_field_letter] = fields[last_field_letter][:-1].strip()
 
-    # G often shares a line with F, e.g. "F) GND G) 1000FT AMSL". Split it.
     if 'F' in fields and 'G' not in fields:
         f_val = fields['F']
         g_split = re.search(r'^(.*?)\s*G\)\s*(.*)$', f_val)
@@ -215,7 +160,6 @@ def parse_entry(raw_text: str) -> dict:
             fields['F'] = g_split.group(1).strip()
             fields['G'] = g_split.group(2).strip()
     elif 'F' in fields and 'G' in fields:
-        # G) may have been duplicated/embedded inside F) text already
         f_val = fields['F']
         g_split = re.search(r'^(.*?)\s*G\)\s*(.*)$', f_val)
         if g_split:
@@ -224,18 +168,18 @@ def parse_entry(raw_text: str) -> dict:
                 fields['G'] = g_split.group(2).strip()
 
     return {
-        'id': notam_id,
-        'type': notam_type,
-        'replaces': replaces,
-        'fir_or_icao': fields.get('A'),
-        'start': fields.get('B'),
-        'end': fields.get('C'),
-        'schedule': fields.get('D'),
-        'description': fields.get('E'),
-        'lower_limit': fields.get('F'),
-        'upper_limit': fields.get('G'),
-        'locations': extract_locations(raw_text),
-        'raw': raw_text,
+        'id':            notam_id,
+        'type':          notam_type,
+        'replaces':      replaces,
+        'fir_or_icao':   fid,
+        'from':          fields.get('B'),
+        'to':            fields.get('C'),
+        'time_schedule': fields.get('D'),
+        'message':       fields.get('E'),
+        'lower':         fields.get('F'),
+        'upper':         fields.get('G'),
+        'locations':     parse_coords(raw_text),
+        'raw':           raw_text,
     }
 
 
@@ -250,14 +194,17 @@ def extract_notams(text: str) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Extract NOTAM entries from a NOTAM summary report and '
-                     'output them as structured JSON.'
+        description='Extract NOTAM entries from a NOTAM summary report.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
     )
     parser.add_argument('input_file', help='Path to the input markdown/text file')
+    parser.add_argument('output', nargs='?', help='Output file path (optional)')
     parser.add_argument(
-        '-o', '--output',
-        help='Path to write JSON output (default: stdout)',
-        default=None,
+        '-f', '--format',
+        choices=['json', 'geojson'],
+        default='json',
+        help="Output format: 'json' (default) or 'geojson'",
     )
     parser.add_argument(
         '--indent', type=int, default=2,
@@ -265,29 +212,39 @@ def main():
     )
     args = parser.parse_args()
 
+    input_path = Path(args.input_file)
+    if not input_path.exists():
+        print(f"Error: file not found – {args.input_file}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        suffix = '.geojson' if args.format == 'geojson' else '.json'
+        output_path = input_path.with_suffix(suffix)
+
     try:
-        with open(args.input_file, 'r', encoding='utf-8') as f:
-            text = f.read()
+        text = input_path.read_text(encoding='utf-8')
     except OSError as e:
         print(f"Error reading {args.input_file}: {e}", file=sys.stderr)
         sys.exit(1)
 
     notams = extract_notams(text)
 
-    output = {
-        'source_file': args.input_file,
-        'count': len(notams),
-        'notams': notams,
-    }
-
-    json_str = json.dumps(output, indent=args.indent, ensure_ascii=False)
-
-    if args.output:
-        with open(args.output, 'w', encoding='utf-8') as f:
-            f.write(json_str)
-        print(f"Extracted {len(notams)} NOTAM entries -> {args.output}", file=sys.stderr)
+    if args.format == 'geojson':
+        output_data = to_geojson(notams)
     else:
-        print(json_str)
+        output_data = notams
+
+    output_path.write_text(
+        json.dumps(output_data, indent=args.indent, ensure_ascii=False),
+        encoding='utf-8',
+    )
+
+    loc_count = sum(1 for n in notams if n['locations'])
+    print(f"Done. {len(notams)} NOTAM entries written to {output_path}")
+    print(f"      {loc_count} entries have coordinates, "
+          f"{len(notams) - loc_count} have no location (null geometry in GeoJSON).")
 
 
 if __name__ == '__main__':
