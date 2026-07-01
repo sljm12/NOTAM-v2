@@ -43,7 +43,7 @@ import re
 import sys
 from pathlib import Path
 
-from notam_common import normalise_ws, parse_coords
+from notam_common import normalise_ws, parse_coords, to_iso8601
 from notam_common import notam_to_geojson_feature, to_geojson
 
 
@@ -184,8 +184,8 @@ def parse_block(block: list[str]) -> dict:
         "message":       message,
         "lower":         lower,
         "upper":         upper,
-        "from":          from_dt,
-        "to":            to_dt,
+        "from":          to_iso8601(from_dt, "%d %b %Y %H:%M"),
+        "to":            to_iso8601(to_dt, "%d %b %Y %H:%M"),
         "time_schedule": time_sched,
         "locations":     locations,
         "raw":           raw_text,

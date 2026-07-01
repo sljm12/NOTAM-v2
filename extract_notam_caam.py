@@ -28,7 +28,7 @@ import re
 import sys
 from pathlib import Path
 
-from notam_common import parse_coords, normalise_ws
+from notam_common import parse_coords, normalise_ws, to_iso8601
 from notam_common import notam_to_geojson_feature, to_geojson
 
 
@@ -172,8 +172,8 @@ def parse_entry(raw_text: str) -> dict:
         'type':          notam_type,
         'replaces':      replaces,
         'fir_or_icao':   fid,
-        'from':          fields.get('B'),
-        'to':            fields.get('C'),
+        'from':          to_iso8601(fields.get('B'), "%y%m%d%H%M"),
+        'to':            to_iso8601(fields.get('C'), "%y%m%d%H%M"),
         'time_schedule': fields.get('D'),
         'message':       fields.get('E'),
         'lower':         fields.get('F'),

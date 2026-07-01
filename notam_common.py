@@ -3,7 +3,8 @@
 notam_common.py — Shared NOTAM parsing utilities
 
 Provides coordinate parsing (DMS → decimal degrees), whitespace
-normalisation, and GeoJSON serialisation for NOTAM data.
+normalisation, ISO 8601 time conversion, and GeoJSON serialisation
+for NOTAM data.
 
 Normalised NOTAM dict fields (used by both CAAS and CAAM parsers):
     id            – e.g. "A1737/26"
@@ -11,8 +12,8 @@ Normalised NOTAM dict fields (used by both CAAS and CAAM parsers):
     message       – body text (before structured fields)
     lower         – lower altitude limit, or None
     upper         – upper altitude limit, or None
-    from          – effective-from string, or None
-    to            – effective-to string, or None
+    from          – effective-from (ISO 8601 string), or None
+    to            – effective-to (ISO 8601 string), or None
     time_schedule – time schedule string, or None
     locations     – list[{"raw", "latitude", "longitude"}]
     replaces      – replaced NOTAM id (CAAM-only), or None
@@ -21,6 +22,7 @@ Normalised NOTAM dict fields (used by both CAAS and CAAM parsers):
 """
 
 import re
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -107,6 +109,25 @@ def parse_coords(text: str) -> list[dict]:
 def normalise_ws(text: str) -> str:
     """Collapse all whitespace runs into a single space and strip."""
     return re.sub(r"\s+", " ", text).strip()
+
+
+# ---------------------------------------------------------------------------
+# ISO 8601 conversion
+# ---------------------------------------------------------------------------
+
+def to_iso8601(value: str | None, fmt: str) -> str | None:
+    """Parse *value* with *fmt* (strptime) and return ISO 8601 UTC string.
+
+    Returns ``None`` unchanged, and preserves sentinel values such as
+    ``"PERM"`` as-is.  If *value* does not match *fmt* (e.g. corrupt
+    source data) the function returns ``None`` instead of crashing.
+    """
+    if not value or value == "PERM":
+        return value
+    try:
+        return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc).isoformat()
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------------
